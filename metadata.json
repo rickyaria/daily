@@ -1,0 +1,6 @@
+{
+  "name": "DAILY CHECK STATIC",
+  "description": "Aplikasi pencatatan data unit tambang sederhana (Hours Meter & Lokasi Unit) yang terintegrasi dengan Google Sheets dan WhatsApp.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
