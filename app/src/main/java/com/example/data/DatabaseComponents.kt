@@ -7,9 +7,13 @@ import kotlinx.coroutines.flow.Flow
 data class UnitEntity(
     @PrimaryKey val nomorUnit: String,
     val lastUpdated: Long = 0,
-    val lastHM: Double = 0.0,
+    val lastHM: Int = 0,
     val lastSektor: String = "",
-    val lastArea: String = ""
+    val lastArea: String = "",
+    val expiresCommissioning: Long = 0,
+    val lastNotes: String = "",
+    val statusUnit: String = "ON HIRE",
+    val conMonData: String = ""
 )
 
 @Entity(tableName = "hm_updates")
@@ -18,10 +22,13 @@ data class HMUpdateEntity(
     val timestamp: Long,
     val email: String,
     val nomorUnit: String,
-    val hoursMeter: Double,
+    val hoursMeter: Int,
     val sektor: String,
     val area: String,
-    val isSynced: Boolean = false
+    val isSynced: Boolean = false,
+    val notes: String = "",
+    val statusUnit: String = "ON HIRE",
+    val conMonData: String = ""
 )
 
 @Dao
@@ -53,6 +60,9 @@ interface HMUpdateDao {
     @Query("SELECT * FROM hm_updates WHERE timestamp >= :startOfDay ORDER BY timestamp DESC")
     fun getUpdatesToday(startOfDay: Long): Flow<List<HMUpdateEntity>>
 
+    @Query("SELECT * FROM hm_updates")
+    suspend fun getAllUpdatesList(): List<HMUpdateEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertUpdate(update: HMUpdateEntity)
 
@@ -75,7 +85,7 @@ interface HMUpdateDao {
     suspend fun deleteAllUpdates()
 }
 
-@Database(entities = [UnitEntity::class, HMUpdateEntity::class], version = 1, exportSchema = false)
+@Database(entities = [UnitEntity::class, HMUpdateEntity::class], version = 5, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun unitDao(): UnitDao
     abstract fun hmUpdateDao(): HMUpdateDao

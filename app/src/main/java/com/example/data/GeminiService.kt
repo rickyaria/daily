@@ -17,9 +17,10 @@ import java.util.concurrent.TimeUnit
 
 data class ParsedUnitUpdate(
     val nomorUnit: String,
-    val hoursMeter: Double,
+    val hoursMeter: Int,
     val sektor: String = "",
-    val area: String = ""
+    val area: String = "",
+    val notes: String = ""
 )
 
 class GeminiService {
@@ -36,8 +37,8 @@ class GeminiService {
     suspend fun parseDailyReport(reportText: String, instructions: String = ""): List<ParsedUnitUpdate> = withContext(Dispatchers.IO) {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
-            Log.e("GeminiService", "Gemini API Key is empty or placeholder.")
-            throw IllegalStateException("API Key Gemini belum dikonfigurasi di panel Secrets.")
+            Log.i("GeminiService", "Gemini API Key is empty or placeholder. Falling back to local offline parser.")
+            return@withContext parseDailyReportLocally(reportText)
         }
 
         val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
@@ -46,10 +47,16 @@ class GeminiService {
             You are an expert mining operations assistant. Parse the following unstructured daily check report text from the admin.
             Extract all heavy machinery hours meter (HM) update entries.
             Return a JSON array of objects. Each object MUST contain:
-            - "nomorUnit": String (normalised to uppercase, strictly alphanumeric only with NO spaces, NO hyphens, and NO symbols, e.g. "DT-101" must become "DT101", "EX-201" must become "EX201", "TL 02" must become "TL02")
-            - "hoursMeter": Double (the numeric value of Hours Meter)
-            - "sektor": String (the sector name e.g. "Sektor A", "Sektor B" or empty string if not found)
-            - "area": String (the location area e.g. "Front Barat", "Stockpile 2" or empty string if not found)
+            - "nomorUnit": String (normalised to uppercase, strictly alphanumeric only with NO spaces, NO hyphens, and NO symbols, e.g. "DT-101" -> "DT101", "GS 794" -> "GS794")
+            - "hoursMeter": Int (integer numeric value of Hours Meter, rounded to nearest whole number, e.g. 45100)
+            - "sektor": String (the sector name if specified or abbreviated like S1, S2, S4, S7, S8 or Sek1, Sek2, Sek4, Sek7, Sek8 or Sektor 1, Sektor 2, Sektor 4, Sektor 7, Sektor 8 -> map to "Sektor 1", "Sektor 2", "Sektor 4", "Sektor 7", "Sektor 8". If no sector abbreviation or number is present, return "Others").
+            - "area": String (the location area. Any text besides unit number, HM, sector, and location prefixes like "lok", "lokasi", "di", "at" is the area. E.g. for "lok S4 Combat", sector is "Sektor 4" and area is "Combat". If no additional area text exists, return empty string "").
+            - "notes": String (any notes, remarks or conditions, or empty string if none)
+
+            CRITICAL SECTOR & AREA REASONING RULES:
+            1. Sector can be abbreviated as S1, S2, S4, S7, S8 or Sek1, Sek2, Sek4, Sek7, Sek8 or Sektor 1, Sektor 2, Sektor 4, Sektor 7, Sektor 8. Always map these abbreviations to "Sektor 1", "Sektor 2", "Sektor 4", "Sektor 7", "Sektor 8".
+            2. Any remaining location text that is NOT the sector abbreviation/number is the AREA. For example, in "GS794 HM 45100 lok S4 Combat", "S4" is Sector "Sektor 4" and "Combat" is Area "Combat".
+            3. If no sector abbreviation or number (S1, S2, S4, S7, S8, Sektor 1, etc.) is found in the entry line, set "sektor" to "Others".
 
             ${if (instructions.isNotBlank()) "User-specified custom parsing command: $instructions" else ""}
 
@@ -87,19 +94,19 @@ class GeminiService {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     val errorMsg = response.body?.string() ?: ""
-                    Log.e("GeminiService", "API Error: ${response.code} $errorMsg")
-                    throw Exception("Gagal menghubungi server Gemini: ${response.code}")
+                    Log.e("GeminiService", "API Error: ${response.code} $errorMsg. Falling back to local parser.")
+                    return@withContext parseDailyReportLocally(reportText)
                 }
 
                 val responseBody = response.body?.string()
                 if (responseBody.isNullOrEmpty()) {
-                    throw Exception("Response body empty")
+                    return@withContext parseDailyReportLocally(reportText)
                 }
 
                 val jsonResponse = JSONObject(responseBody)
                 val candidates = jsonResponse.getJSONArray("candidates")
                 if (candidates.length() == 0) {
-                    throw Exception("Tidak ada respon dari Gemini")
+                    return@withContext parseDailyReportLocally(reportText)
                 }
 
                 val text = candidates.getJSONObject(0)
@@ -120,11 +127,118 @@ class GeminiService {
                     .trim()
 
                 val parsedList = adapter.fromJson(cleanJson)
-                parsedList ?: emptyList()
+                parsedList ?: parseDailyReportLocally(reportText)
             }
         } catch (e: Exception) {
-            Log.e("GeminiService", "Error parsing report", e)
-            throw e
+            Log.e("GeminiService", "Error parsing report with Gemini API, falling back to local offline parser.", e)
+            return@withContext parseDailyReportLocally(reportText)
         }
+    }
+
+    private fun parseDailyReportLocally(reportText: String): List<ParsedUnitUpdate> {
+        val result = mutableListOf<ParsedUnitUpdate>()
+        val lines = reportText.split("\n")
+        
+        // Regex to match a unit number, e.g. DT101, EX201, DZ301, GD401, GS794, LD501, etc.
+        val unitRegex = Regex("""\b([A-Za-z]{2,3}\s*\d{2,4})\b""")
+        
+        // Regex to find HM number, e.g. "HM 1435.2" or "HM: 1435.2" or "1435.2 HM" or "HM 45100"
+        val hmRegex = Regex("""(?i)hm\s*:?\s*(\d+(?:[.,]\d+)?)""")
+        
+        // Regex for sector - supports "Sektor 1", "Sek 1", "Sek1", "S1", "Sektor A", etc.
+        val sektorRegex = Regex("""(?i)\b(?:sektor|sek|s)\s*([12478a-d]|others)\b""")
+        
+        for (line in lines) {
+            if (line.isBlank()) continue
+            
+            val unitMatch = unitRegex.find(line)
+            if (unitMatch != null) {
+                val nomorUnit = unitMatch.groupValues[1].replace(" ", "").uppercase()
+                
+                // Extract HM
+                var hmValue = 0
+                val hmMatch = hmRegex.find(line)
+                if (hmMatch != null) {
+                    val doubleVal = hmMatch.groupValues[1].replace(",", ".").toDoubleOrNull() ?: 0.0
+                    hmValue = Math.round(doubleVal).toInt()
+                } else {
+                    val numberRegex = Regex("""\b(\d+(?:[.,]\d+)?)\b""")
+                    val numbers = numberRegex.findAll(line).map { it.value }.toList()
+                    for (numStr in numbers) {
+                        val cleanNum = numStr.replace(",", ".")
+                        if (!nomorUnit.contains(numStr)) {
+                            val parsedNum = cleanNum.toDoubleOrNull()
+                            if (parsedNum != null) {
+                                hmValue = Math.round(parsedNum).toInt()
+                                break
+                            }
+                        }
+                    }
+                }
+                
+                // Extract Sektor
+                var sektor = ""
+                val sektorMatch = sektorRegex.find(line)
+                if (sektorMatch != null) {
+                    val matchedSektorVal = sektorMatch.groupValues[1].uppercase()
+                    sektor = when (matchedSektorVal) {
+                        "1", "A" -> "Sektor 1"
+                        "2", "B" -> "Sektor 2"
+                        "4", "C" -> "Sektor 4"
+                        "7", "D" -> "Sektor 7"
+                        "8" -> "Sektor 8"
+                        "OTHERS" -> "Others"
+                        else -> "Sektor $matchedSektorVal"
+                    }
+                } else {
+                    val lowerLine = line.lowercase()
+                    if (lowerLine.contains("sektor 1")) sektor = "Sektor 1"
+                    else if (lowerLine.contains("sektor 2")) sektor = "Sektor 2"
+                    else if (lowerLine.contains("sektor 4")) sektor = "Sektor 4"
+                    else if (lowerLine.contains("sektor 7")) sektor = "Sektor 7"
+                    else if (lowerLine.contains("sektor 8")) sektor = "Sektor 8"
+                    else if (lowerLine.contains("others")) sektor = "Others"
+                }
+                
+                // Extract Area (everything else in line excluding unit, HM, sector, and location prefixes)
+                var cleanLine = line
+                cleanLine = cleanLine.replace(unitMatch.value, "", ignoreCase = true)
+                if (hmMatch != null) {
+                    cleanLine = cleanLine.replace(hmMatch.value, "", ignoreCase = true)
+                } else if (hmValue > 0) {
+                    cleanLine = cleanLine.replace(hmValue.toString(), "", ignoreCase = true)
+                }
+                if (sektorMatch != null) {
+                    cleanLine = cleanLine.replace(sektorMatch.value, "", ignoreCase = true)
+                }
+                
+                // Remove prefixes like "lokasi", "lok.", "lok:", "lok", "di", "at", "hm"
+                cleanLine = cleanLine.replace("(?i)\\b(lokasi|lok|di|at|hm)\\b".toRegex(), "")
+                    .replace(":", " ")
+                    .replace("-", " ")
+                    .replace(",", " ")
+                    .trim()
+                
+                var area = cleanLine.replace("\\s+".toRegex(), " ").trim()
+                if (area.lowercase().startsWith("sektor") || area.lowercase().startsWith("sek")) {
+                    area = ""
+                }
+                
+                if (sektor.isBlank()) {
+                    sektor = "Others"
+                }
+
+                if (nomorUnit.isNotBlank()) {
+                    result.add(ParsedUnitUpdate(
+                        nomorUnit = nomorUnit,
+                        hoursMeter = hmValue,
+                        sektor = sektor,
+                        area = area,
+                        notes = ""
+                    ))
+                }
+            }
+        }
+        return result
     }
 }
